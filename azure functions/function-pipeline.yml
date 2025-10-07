@@ -1,0 +1,125 @@
+trigger:
+  branches:
+    include:
+      - dev
+      - uat
+      - main
+
+variables:
+  - name: azureSubscription
+    value: 'DL-sc'
+  - name: functionAppName 
+    value: ''
+  - name: resourceGroup
+    value: ''   
+
+stages:
+# ------------------------
+# Stage 1: Build
+# ------------------------
+- stage: Build
+  displayName: Build Function App
+  jobs:
+  - job: BuildJob
+    pool:
+      vmImage: 'ubuntu-latest'
+    variables:
+      projectDir: $(Build.SourcesDirectory)
+    steps:
+      # Step 0: Set Function App + Resource Group
+      - powershell: |
+          $branch = "$(Build.SourceBranchName)"
+          switch ($branch) {
+            'dev' {
+              $appName = 'dataloom-func-verifi-dev-01'
+              $rgName  = 'IXO-Dataloom-MVP-01'
+            }
+            'uat' {
+              $appName = 'dataloom-func-verifi-uat-01'
+              $rgName  = 'IXO-Dataloom-MVP-uat-01'
+            }
+            'main' {
+              $appName = 'dataloom-func-verifi-prod-01'
+              $rgName  = 'IXO-Dataloom-MVP-prod-01'
+            }
+            default {
+              Write-Host "##vso[task.logissue type=error]Unsupported branch: $branch"
+              exit 1
+            }
+          }
+          Write-Host "##vso[task.setvariable variable=functionAppName]$appName"
+          Write-Host "##vso[task.setvariable variable=resourceGroup]$rgName"
+          Write-Host "Selected Function App: $appName"
+          Write-Host "Selected Resource Group: $rgName"
+        displayName: 'Set Function App + Resource Group'
+
+      # Step 1: Use Python 3.12 
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: '3.12'
+        displayName: 'Use Python 3.12'
+
+      # Step 2: Install requirements
+      - script: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+        displayName: 'Install requirements'
+        workingDirectory: $(projectDir)
+
+      # Step 3: Archive function app
+      - task: ArchiveFiles@2
+        inputs:
+          rootFolderOrFile: '$(projectDir)'
+          includeRootFolder: false
+          archiveType: 'zip'
+          archiveFile: '$(Build.ArtifactStagingDirectory)/app.zip'
+          replaceExistingArchive: true
+        displayName: 'Archive Authorizer Function App'
+
+      # Step 4: Publish artifact
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: 'drop'
+          publishLocation: 'Container'
+        displayName: 'Publish Build Artifact'
+
+# ------------------------
+# Stage 2: Deploy
+# ------------------------
+- stage: Deploy
+  displayName: Deploy Function App
+  dependsOn: Build
+  jobs:
+  - job: DeployJob
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      # Step 1: Download artifact
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: current
+          downloadType: single
+          artifactName: drop
+          downloadPath: $(Pipeline.Workspace)
+        displayName: 'Download Build Artifact'
+
+      # Step 2: Deploy ZIP via Azure CLI
+      - task: AzureCLI@2
+        inputs:
+          connectedServiceNameARM: $(azureSubscription)
+          scriptType: bash
+          scriptLocation: inlineScript
+          workingDirectory: '$(Pipeline.Workspace)/drop'
+          inlineScript: |
+            echo "Checking if Function App exists..."
+            az functionapp show --name $(functionAppName) --resource-group $(resourceGroup)
+
+            echo "Deploying ZIP to: $(functionAppName)"
+            az functionapp deployment source config-zip \
+              --name $(functionAppName) \
+              --resource-group $(resourceGroup) \
+              --src $(Pipeline.Workspace)/drop/app.zip
+
+            echo "✅ Deployment complete"
+        displayName: 'Deploy Function App (ZIP)'
