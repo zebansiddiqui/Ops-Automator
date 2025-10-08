@@ -28,3 +28,6 @@ git config user.email
 #setting the name globally
 git config --global user.name
 git config --global user.email
+
+#This shows the complete information about the environment, user, tenant etc
+az account show
