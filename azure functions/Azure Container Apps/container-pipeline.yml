@@ -1,0 +1,151 @@
+parameters:
+- name: environment
+  displayName: Select Environment
+  type: string
+  default: dev
+  values:
+    - dev
+    - uat
+    - main
+
+trigger: none
+
+pr: none
+
+variables:
+  - ${{ if or(eq(parameters.environment, 'dev'), startsWith(variables['Build.SourceBranch'], 'dev-')) }}:
+      - group: chatbot-frontend-dev
+  - ${{ if eq(parameters.environment, 'uat') }}:
+      - group: chatbot-frontend-uat
+  - ${{ if eq(parameters.environment, 'main') }}:
+      - group: chatbot-frontend-prod
+
+stages:
+- stage: BuildAndPush
+  displayName: Build and Push Docker Image
+  jobs:
+    - job: Build
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - task: AzureCLI@2
+          displayName: Build and Push to ACR
+          inputs:
+            azureSubscription: "xanadu-sc"
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              BRANCH_NAME=${BUILD_SOURCEBRANCH#refs/heads/}
+              echo "Using branch: $BRANCH_NAME"
+
+              # Map branch to environment tag
+              case "$BRANCH_NAME" in
+                dev|uat|main)
+                  ENV_TAG=$BRANCH_NAME
+                  ;;
+                dev-*|feature/*)
+                  ENV_TAG="dev"
+                  ;;
+                *)
+                  echo "❌ Unsupported branch: $BRANCH_NAME"
+                  exit 1
+                  ;;
+              esac
+
+              echo "🔐 Logging into ACR..."
+              az acr login --name $(acrName)
+
+              echo "🐳 Building Docker image from KB_chatBot folder..."
+              cd KB_chatBot
+              docker build -f Dockerfile.frontend -t $(imageName):$(Build.BuildId) .
+
+              echo "🏷️ Tagging Docker image..."
+              docker tag $(imageName):$(Build.BuildId) $(acrLoginServer)/$(imageName):$(Build.BuildId)
+              docker tag $(imageName):$(Build.BuildId) $(acrLoginServer)/$(imageName):$ENV_TAG
+
+              echo "📦 Pushing Docker images..."
+              docker push $(acrLoginServer)/$(imageName):$(Build.BuildId)
+              docker push $(acrLoginServer)/$(imageName):$ENV_TAG
+
+- stage: Deploy
+  displayName: Deploy to Azure Container App
+  dependsOn: BuildAndPush
+  condition: |
+    or(
+      eq(variables['Build.SourceBranchName'], 'dev'),
+      startsWith(variables['Build.SourceBranch'], 'refs/heads/dev-'),
+      eq(variables['Build.SourceBranchName'], 'uat'),
+      eq(variables['Build.SourceBranchName'], 'main')
+    )
+  jobs:
+    - job: Deploy
+      displayName: Deploy Container App
+      pool:
+        vmImage: 'ubuntu-latest'
+      steps:
+        - task: AzureCLI@2
+          displayName: Deploy to ACA (Create if not exists)
+          inputs:
+            azureSubscription: "xanadu-sc"
+            scriptType: bash
+            scriptLocation: inlineScript
+            inlineScript: |
+              BRANCH_NAME=${BUILD_SOURCEBRANCH#refs/heads/}
+              echo "Using branch: $BRANCH_NAME"
+
+              echo "🧠 Mapping settings for branch: $BRANCH_NAME"
+              case "$BRANCH_NAME" in
+                dev|dev-*|feature/*)
+                  resourceGroup="xanadu-rgp-dev-01"
+                  containerAppName="xanadu-chatbot-frontend-dev-01"
+                  containerAppEnv="xanadu-env-dev-01"
+                  ;;
+                uat)
+                  resourceGroup="xanadu-rgp-uat-01"
+                  containerAppName="xanadu-chatbot-frontend-uat-01"
+                  containerAppEnv="xanadu-env-uat-01"
+                  ;;
+                main)
+                  resourceGroup="xanadu-rgp-prod-01"
+                  containerAppName="xanadu-chatbot-frontend-prod-01"
+                  containerAppEnv="xanadu-env-prod-01"
+                  ;;
+                *)
+                  echo "❌ Unsupported branch: $BRANCH_NAME"
+                  exit 1
+                  ;;
+              esac
+
+              echo "🔐 Getting ACR credentials..."
+              USERNAME=$(az acr credential show --name $(acrName) --query username --output tsv)
+              PASSWORD=$(az acr credential show --name $(acrName) --query passwords[0].value --output tsv)
+
+              echo "🔍 Checking if Container App exists..."
+              EXISTS=$(az containerapp show \
+                --name $containerAppName \
+                --resource-group $resourceGroup \
+                --only-show-errors \
+                --query "name" \
+                -o tsv 2>/dev/null || echo "")
+
+              if [ -z "$EXISTS" ]; then
+                echo "📦 Container App not found. Creating..."
+                az containerapp create \
+                  --name $containerAppName \
+                  --resource-group $resourceGroup \
+                  --environment $containerAppEnv \
+                  --image $(acrLoginServer)/$(imageName):$(Build.BuildId) \
+                  --cpu 1 \
+                  --memory 2Gi \
+                  --registry-server $(acrLoginServer) \
+                  --registry-username $USERNAME \
+                  --registry-password $PASSWORD \
+                  --ingress external \
+                  --target-port $port
+              else
+                echo "♻️ Container App exists. Updating image..."
+                az containerapp update \
+                  --name $containerAppName \
+                  --resource-group $resourceGroup \
+                  --image $(acrLoginServer)/$(imageName):$(Build.BuildId)
+              fi
