@@ -1,8 +1,3 @@
-Below is a clean, professional **Markdown documentation** that you can directly copy into your GitHub repository.
-It explains **purpose**, **prerequisites**, **commands**, and **what each command does** in a neat format.
-
----
-
 # 📘 Azure Container Registry (ACR) — Image Cleanup Task Documentation
 
 This document explains how to create and manage an **Azure Container Registry (ACR) Task** that automatically removes **untagged images older than 365 days**.
